@@ -1,1 +1,326 @@
-"This will be code" 
+//////
+//
+// Author: Matthias Schubert                                                                                                        
+// Original python code by Gonzalo Mateo-García et al.                                                                              
+// Original paper: Mateo-García, G.; Gómez-Chova, L.; Amorós-López, J.; Muñoz-Marí, J.; Camps-Valls, G. (2018) Multitemporal Cloud  
+//                 Masking in the Google Earth Engine. Remote Sens. 2018, 10, 1079                                                  
+//                                                                                                                                  
+// This code transfers Mateo-García's scientific research on multitemporal cloud masking so it can be used with the Java Script     
+// API. Furthermore, instead of Landsat 8, data from Sentinel 2 is used.                                                            
+// The script is designed to have only one parameter (namely the image on which the cloud mask should be calculated), so it can be  
+// easily mapped automatically over a whole Image Collection.                                                                       
+//
+//////
+
+
+
+
+
+//////
+//
+// Complementary Functions
+//
+//////
+
+// Function to simply clip every Image of an Image Collection.
+var clipImage = function(clipping_geometry) {
+  var wrap = function(image) {
+    var clipped_image = image.clip(clipping_geometry);
+    return clipped_image;
+  };
+  return wrap;
+};
+
+
+// Function to compute new CLOUDY_PIXEL_PERCENTAGE-property (CPP) for clipped images.  
+var newCPP = function(area_of_interest) {
+  var wrap = function(image) {
+    var qa60 = image.select(['QA60']);
+    qa60 = qa60.unmask();
+    // Get all cloudy pixels from QA60-band.
+    var clouds = qa60.expression(
+      'denseCloud || cirrus',{
+        'denseCloud': qa60.eq(1024),
+        'cirrus': qa60.eq(2048)
+    });
+    // Count all cloudy pixels (all pixels with value 1).
+    var countCloudyPixels = clouds.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: area_of_interest,
+      scale : 10
+    });
+    // Get all cloud-free pixels from QA60-band.
+    var noClouds = qa60.expression(
+      'cloudless',{
+        'cloudless': qa60.eq(0),
+    });
+    // Count all cloud-free pixels (all pixels with value 1).
+    var countNoCloudPixels = noClouds.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: area_of_interest,
+      scale: 10
+    });
+    // Compute new ratio (CPP). #cloudy pixels / #all pixels * 100.
+    var nrCloudyPixels = ee.Number(countCloudyPixels.get('QA60')).int();
+    var nrNoCloudPixels = ee.Number(countNoCloudPixels.get('QA60')).int();
+    var allPixels = ee.Number(nrCloudyPixels.add(nrNoCloudPixels));
+    var newCPP = ee.Number(nrCloudyPixels.divide(allPixels).multiply(100));
+    return image.set({CLOUDY_PIXEL_PERCENTAGE: newCPP});
+  };
+  return wrap;
+};
+
+
+// Function to eliminate several same images in a row. 
+var getRidOfDoubles = function(image, list) {
+  var previous = ee.Image(ee.List(list).get(-1));
+  var date_0 = ee.Date(previous.get('system:time_start')).format('YYYY-MM-dd');
+  var date_1 = ee.Date(ee.Image(image).get('system:time_start')).format('YYYY-MM-dd');
+  
+  var marked_image = ee.Algorithms.If(ee.Algorithms.IsEqual(date_0, date_1), 
+  marked_image = image.set('repetition?', 1), 
+  marked_image = image.set('repetition?', 0));
+  
+  return ee.List(list).add(marked_image);
+};
+
+
+// Function that returns a normalized feature collection together with mean and std. 
+var  computeNormalizationFeatureCollection = function(feature_collection, bands_to_normalize) {
+  var bands_to_normalize_server = ee.List(bands_to_normalize);
+  
+  var mean = feature_collection.reduceColumns({
+    reducer: ee.Reducer.mean().forEach(bands_to_normalize_server),
+    selectors: bands_to_normalize_server
+  });
+  
+  var sd = feature_collection.reduceColumns({
+    reducer: ee.Reducer.stdDev().forEach(bands_to_normalize_server),
+    selectors: bands_to_normalize_server
+  });
+  
+  var normalizeFeature = function(feature) {
+    feature = ee.Feature(feature);
+    var values = bands_to_normalize_server.map(function(i) {
+      var dummi_number = ee.Number(feature.get(i)).subtract(mean.get(i)).divide(sd.get(i));
+      return dummi_number;
+    });  
+    var dic = ee.Dictionary.fromLists(bands_to_normalize_server, values);
+    return feature.setMulti(dic);
+  };
+  
+  var mapped_feature_collection = feature_collection.map(normalizeFeature);
+  mapped_feature_collection = mapped_feature_collection.set('mean', mean, 'sd', sd);
+  return mapped_feature_collection;
+};
+
+
+// Function that normalizes an Image based on mean and standart deviation values from the training feature.
+var applyNormalizationImage = function(img, mean, sd) {
+  var normalized_img = ee.ImageCollection.fromImages(
+  img.bandNames().map(function(band){
+    band = ee.String(band);
+    var img_band = img.select(band);
+    return img_band.subtract(ee.Number(mean.get(band))).divide(ee.Number(sd.get(band)))
+  })).toBands().rename(img.bandNames());
+  return normalized_img;
+};
+
+
+// Function to select the clusters. 
+var selectClusters = function(img, background_model, result_clustering, n_clusters, bands_thresholds, region_of_interest) {
+  
+  var n_clusters_list = ee.List.sequence(0, n_clusters.subtract(1));
+  
+  var bands_norm_difference = bands_thresholds.map(function(bands) {
+    var entry = ee.String(bands).cat("_difference");
+    return entry;
+  });
+  
+  var img_joined = img.subtract(background_model).select(bands_thresholds, bands_norm_difference).addBands(img.select(bands_thresholds));
+  
+  var bands_and_difference_bands = bands_thresholds.cat(bands_norm_difference);
+  
+  var wrap = n_clusters_list.map(function(i) {
+    i = ee.Number(i);
+    var img_diff_clus = img_joined.updateMask(result_clustering.eq(i)).select(bands_and_difference_bands);
+    var clusteri = img_diff_clus.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: region_of_interest,
+      bestEffort: true,
+      scale: 10,
+      tileScale: 4
+    });
+  
+    var clusteri_diff = clusteri.toArray(bands_norm_difference);
+    var clusteri_refl = clusteri.toArray(bands_thresholds);
+  
+    var clusteri_refl_norm = clusteri_refl.multiply(clusteri_refl).reduce(ee.Reducer.mean(), [0]).sqrt().get([0]);
+    var clusteri_diff_mean = clusteri_diff.reduce(ee.Reducer.mean(), [0]).get([0]);
+    var clusteri_diff_norm = clusteri_diff.multiply(clusteri_diff).reduce(ee.Reducer.mean(), [0]).sqrt().get([0]);
+
+  
+    var multitemporal_score_clusteri = ee.Algorithms.If(clusteri_diff_mean.gt(0), clusteri_diff_norm, clusteri_diff_norm.multiply(-1));
+    multitemporal_score_clusteri = result_clustering.eq(i).toFloat().multiply(ee.Number(multitemporal_score_clusteri));
+    var reflectance_score_clusteri = result_clustering.eq(i).toFloat().multiply(ee.Number(clusteri_refl_norm));
+  
+    var multitemporal_score = multitemporal_score_clusteri;
+    var reflectance_score = reflectance_score_clusteri;
+  
+    var scores = ee.Dictionary({multitemporalScore: multitemporal_score, reflectanceScore: reflectance_score});
+  
+    return scores; 
+  
+  });
+  
+  return wrap;
+};
+
+
+// Function to merge all Images of an Image Collection into a single Image with 1 band.
+var mergeBands = function(image, previous) {
+  return ee.Image(previous).add(image);
+};
+
+
+
+
+
+//////
+//
+// Main code that calculates the multitemporal cloud mask, invokes the codes above.
+// clipping_geometry is used when the cloud mask is intended to be calculated for only a portion of the scene. Can be changed 
+// to image.geometry().coordinates(); if the whole image should be taken into account, or any other area of interest.
+//
+//////
+
+var constructCloudMask = function(image) {
+  image =  ee.Image(image).unmask();
+  var clipping_geometry = ee.Geometry.Rectangle(9.336300201993254, 48.50932394882417, 9.538860626797941, 48.60385511195916);
+  // Define important parameters.
+  // See original scientific paper by Mateo-García et al. for further information on the thresholds.
+  var bands_model = image.bandNames();
+  var bands_threshold = ee.List(["B2", "B3", "B4"]);
+  var n_clusters = ee.Number(10);
+  var threshold_dif_cloud = ee.Number(0.045).multiply(10000);
+  var numPixels = ee.Number(1000);
+  var threshold_reflectance = ee.Number(0.175).multiply(10000);
+  var growing_ratio = ee.Number(2); 
+  
+  // Steps to calculate background model (mean of the three images chronologically before the cloudy image).
+  // Extract start and end date for future Image Collection based on cloudy image.
+  var end_date = ee.Date(image.get('system:time_start'));
+  var start_date_number = ee.Number.parse(ee.Date(image.get('system:time_start')).format('YYYY')).subtract(1);
+  var start_date = ee.Date.parse('YYYY', start_date_number);
+  var list_dates = ee.List.sequence(1, 2).set(0, start_date).set(1, end_date);
+  var image_system_index = image.get('system:index');
+  // Construct Image Collection. Start: 1 Year before image aqucisition date. End: acqusition date.
+  var image_collection = ee.ImageCollection('COPERNICUS/S2')
+  .filterDate(list_dates.get(0), list_dates.get(1))
+  .filterBounds(clipping_geometry)
+  .filter(ee.Filter.neq('system:index', image_system_index))
+  .sort('system:time_start');
+  // Clip constructed image collection to geometry.
+  var clipped_image_collection = image_collection.map(clipImage(clipping_geometry));
+  // Calculate new CPP value for all images in clipped image collection.
+  var clipped_image_collection_newCPP = clipped_image_collection.map(newCPP(clipping_geometry));
+  // Filter image collection for CPP less than 10.
+  var filtered_clipped_image_collection_newCPP = clipped_image_collection
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 10));
+  // Get rid of doubled images. 
+  var filtered_clipped_image_collection_newCPP_unique = filtered_clipped_image_collection_newCPP
+  .iterate(getRidOfDoubles, ee.List([ee.Image(0).set('system:time_start', 0, 'repetition?', 1)]));
+  var filtered_clipped_image_collection_newCPP_unique_1 = ee.ImageCollection(ee.List(filtered_clipped_image_collection_newCPP_unique)
+  .filter(ee.Filter.neq('repetition?', 1)));
+  // Slice image collection to the last three images. 
+  var filtered_clipped_image_collection_newCPP_unique_limit = filtered_clipped_image_collection_newCPP_unique_1
+  .limit(3, 'system:time_start', false)
+  .sort('system:time_start');
+  // Combine pictures using a median filter. Background Model is finished.
+  var median_picture = ee.Image(filtered_clipped_image_collection_newCPP_unique_limit
+  .median());
+  
+  // Calculate difference image (cloud image - background model).
+  var difference_image = image.subtract(median_picture);
+
+  // K-means clustering.
+  var training = difference_image.sample(clipping_geometry, 10, null, null, numPixels, 0, true, 2);
+  var normalized_training = computeNormalizationFeatureCollection(training, bands_model);
+  var mean = ee.Dictionary(normalized_training.get('mean'));
+  var sd = ee.Dictionary(normalized_training.get('sd'));
+  normalized_training = normalized_training.set('mean', null, 'sd', null); 
+  var clusterer = ee.Clusterer.wekaKMeans(n_clusters).train(normalized_training);
+  var difference_image_normalized = applyNormalizationImage(difference_image, mean, sd);
+  var result = difference_image_normalized.cluster(clusterer);
+  
+  // Calculate multitemporal score and reflectance score.
+  var multi_refl_scores = selectClusters(image, median_picture, result, n_clusters, bands_threshold, clipping_geometry);
+  var multitemporal_score = ee.List.sequence(0, n_clusters.subtract(1)).map(function(i) {
+    return ee.Dictionary(multi_refl_scores.get(i)).get('multitemporalScore');
+  });
+  var multitemporal_score_IC = ee.ImageCollection(multitemporal_score);
+  var multitemporal_score_IMG = ee.Image(multitemporal_score_IC.iterate(mergeBands, ee.Image([0])));
+  
+  var reflectance_score = ee.List.sequence(0, n_clusters.subtract(1)).map(function(i) {
+    return ee.Dictionary(multi_refl_scores.get(i)).get('reflectanceScore');
+  });
+  var reflectance_score_IC = ee.ImageCollection(reflectance_score);
+  var reflectance_score_IMG = ee.Image(reflectance_score_IC.iterate(mergeBands, ee.Image([0])));
+ 
+  // #Apply thresholds.
+  var cloud_score_threshold = ee.Image(ee.Algorithms.If(threshold_reflectance.lte(0), 
+  cloud_score_threshold = multitemporal_score_IMG.gt(threshold_dif_cloud), 
+  cloud_score_threshold = multitemporal_score_IMG.gt(threshold_dif_cloud).multiply(reflectance_score_IMG.gt(threshold_reflectance))));
+
+  // #Apply openings.
+  var kernel = ee.Kernel.circle(growing_ratio);
+  cloud_score_threshold = cloud_score_threshold.focal_min({kernel: kernel}).focal_max({kernel: kernel});
+  
+  // #Mask out non-cloud pixels.
+  cloud_score_threshold = cloud_score_threshold.mask(cloud_score_threshold.eq(1));
+
+  return cloud_score_threshold; 
+
+};
+
+
+
+
+
+//////
+// 
+// Example code to demonstrate calculation of cloud mask.
+//
+//////
+
+// Sentinel 2 data.
+var rectangle = ee.Geometry.Rectangle(9.336300201993254, 48.50932394882417, 9.538860626797941, 48.60385511195916);
+var imageCollection = ee.ImageCollection('COPERNICUS/S2')
+.filterDate('2016-06-18', '2016-09-29')
+.filterBounds(rectangle)
+.sort('system:time_start');
+var imageCollectionList = imageCollection.toList(imageCollection.size());
+var image = ee.Image(imageCollectionList.get(9));
+
+// Construct Cloud Mask.
+var cloudMask = constructCloudMask(image);
+
+// Printing and Visualization.
+print('image collection', imageCollection);
+print('image', image);
+print('cloud mask', cloudMask)
+
+var vizParamsRGB = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0,
+  max: 3000};
+
+var vizParamsCloudMaskMasked = {
+  palette: ['#008000', '#000080'], 
+  min: 0, 
+  max: 1};
+
+Map.addLayer(image, vizParamsRGB, 'image');
+Map.addLayer(cloudMask, vizParamsCloudMaskMasked, 'cloud mask');
+Map.addLayer(rectangle, {}, 'clipping geometry');
+Map.centerObject(rectangle, 10);
